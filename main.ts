@@ -1,31 +1,36 @@
-// Dip-reversal scalper for make.fun "Race a BTC trading bot live for 24 hours"
+// Dip-reversal rider for make.fun "Race a BTC trading bot live for 24 hours"
 // (btc-race-24h-20261117-0603). Long-only cbBTC/USDC, 1-minute bars, $1,000 paper.
 //
-// Idea, tuned on this competition's published dev window (24h ending at the
-// open, BTC +0.49%, range $63,874-$65,467, calm: worst 1-minute move 0.45%):
-// the dev day's only durable edge was deep, hour-scale dips that reversed.
-// Frequent trading bleeds out: one full-size round trip costs ~26 bps in fee,
-// slippage and pool impact, and 1-minute noise is ~6 bps, so small triggers
-// and tight exits lose to costs (verified offline: RSI/EMA variants lost
-// $90-$127 on the dev window, mostly fees). This bot therefore waits for a
-// rare, deep dip and then holds patiently for a real reversal:
+// What the dev window (24h, BTC +0.49%, range $63,874-$65,467) showed:
+// the day's only durable edge was deep, hour-scale dips that reversed into
+// multi-hour climbs. Frequent trading bleeds out: one full-size round trip
+// costs ~26 bps in fee, slippage and pool impact, and 1-minute noise is
+// ~6 bps, so small triggers and tight exits lose to costs (verified
+// offline: RSI/EMA variants lost $90-$127 on the dev window, mostly fees;
+// short-lookback dip-buys lost $13-$40). This bot therefore waits for a
+// rare, deep dip and then rides the reversal instead of capping it with a
+// tight take-profit:
 //
 //   Entry: close down >= 1.0% over the last 60 bars AND an uptick
 //          (close above the previous bar's close), full cash, one position.
-//          A second, slower trigger covers deep two-hour grinds: down
-//          >= 1.5% over 120 bars with an uptick.
-//   Exit:  +1.2% from the fill price, or -0.8%, or 120 bars held, whichever
-//          comes first (+1.5% / -1.0% / 180 bars for the slow trigger);
-//          sells the whole position.
+//   Exit:  +2.0% from the fill price, or -0.8%, or 240 bars held, or a
+//          trailing stop: once the trade is up > +0.2%, sell if the close
+//          falls 0.4% below the highest close since entry.
+//          Sells the whole position.
 //   max_slippage_bps 300 on every order.
 //
 // Offline replay of the same rules on the dev window (same fill model:
 // next-open fills, 4 bps fee, 2 bps slippage, constant-product impact
-// against the bar's open depth): net PnL +$11.01, 3 round trips, max
-// drawdown 0.57%. The big winner was the day's main dip (bought ~$64,220,
-// sold ~$64,996, +1.21%). No randomness, no clock, no network: the only
-// state is the close history and the entry fill price, so two runs on the
-// same data produce byte-identical orders.
+// against the bar's open depth): net PnL +$28.02, 3 round trips, max
+// drawdown 1.06%. The big winner rode the day's main dip (bought ~$64,052,
+// sold ~$65,282, +1.92%). A fixed +1.2% take-profit on the same entries
+// scores only +$11.01 — letting winners run is worth ~$17 on this window.
+// The result is a plateau, not a knife edge: trailing 0.3-0.6%, hold
+// 180-300 bars and take-profit 1.5-3.0% all score +$22 to +$28 offline,
+// and the strategy is in profit on both halves of the dev window.
+// No randomness, no clock, no network: the only state is the close
+// history, the entry fill price and the peak close since entry, so two
+// runs on the same data produce byte-identical orders.
 
 import { runBars } from './vendor/makefun-bars.ts';
 import type { BarsState, Batch } from './vendor/makefun-bars.ts';
@@ -33,23 +38,19 @@ import type { BarsState, Batch } from './vendor/makefun-bars.ts';
 const SYMBOL = 'CBBTC';
 
 // Strategy parameters (basis points unless noted).
-//
-// Two entry triggers, both dip-reversals confirmed by an uptick, full cash,
-// one position at a time. Trigger A is the workhorse, tuned on the dev
-// window; trigger B never fired there (no 120-bar drop of 1.5% while flat),
-// so adding it leaves the dev result unchanged, but it covers a case A
-// misses on the unseen race day: a slow two-hour grind down with no single
-// hour down 1%. Its exits are wider to match its slower scale.
-const TRIGGERS = [
-  { lookback: 60, dipBps: 100, tpBps: 120, slBps: 80, holdBars: 120 }, // A
-  { lookback: 120, dipBps: 150, tpBps: 150, slBps: 100, holdBars: 180 }, // B
-];
+const LOOKBACK = 60; // entry dip measured over this many bars
+const DIP_BPS = 100; // enter when close is down >= 1.0% over LOOKBACK bars
+const TP_BPS = 200; // take profit +2.0% from the fill price
+const SL_BPS = 80; // stop loss -0.8% from the fill price
+const TRAIL_BPS = 40; // trailing stop: 0.4% below the peak close since entry
+const TRAIL_ARM_BPS = 20; // trailing stop arms once the trade is up > +0.2%
+const HOLD_BARS = 240; // time stop: sell after 240 bars held
 const MAX_SLIPPAGE_BPS = 300;
 
 const closes: bigint[] = [];
 let entryPrice: bigint | null = null;
 let entrySeq = -1;
-let active: (typeof TRIGGERS)[number] | null = null;
+let peakClose: bigint | null = null;
 
 function bpsChange(now: bigint, before: bigint): bigint {
   // (now - before) / before, in basis points, truncated toward zero.
@@ -65,10 +66,11 @@ await runBars({
         if (fill.side === 'buy') {
           entryPrice = BigInt(fill.price);
           entrySeq = batch.seq;
+          peakClose = entryPrice;
         } else {
           entryPrice = null;
           entrySeq = -1;
-          active = null;
+          peakClose = null;
         }
       }
     }
@@ -83,31 +85,33 @@ await runBars({
     const qty = held === undefined ? 0n : held.qty;
 
     if (qty > 0n) {
-      // Holding: take profit, stop loss, or time stop, per the trigger
-      // that opened the position.
-      if (entryPrice !== null && active !== null) {
+      // Holding: take profit, stop loss, time stop, or trailing stop.
+      if (entryPrice !== null && peakClose !== null) {
+        if (close > peakClose) peakClose = close;
         const ret = bpsChange(close, entryPrice);
         const heldBars = batch.seq - entrySeq;
-        if (ret >= active.tpBps || ret <= -active.slBps || heldBars >= active.holdBars) {
+        const trailedOff =
+          ret > TRAIL_ARM_BPS &&
+          close * 10_000n <= peakClose * (10_000n - BigInt(TRAIL_BPS));
+        if (
+          ret >= TP_BPS ||
+          ret <= -SL_BPS ||
+          heldBars >= HOLD_BARS ||
+          trailedOff
+        ) {
           return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
         }
       }
       return [];
     }
 
-    // Flat: enter on the first trigger whose dip + uptick both hold.
-    // A is tried first: when both fire on the same bar, the faster, tighter
-    // trigger owns the trade.
-    if (closes.length <= 1) return [];
+    // Flat: enter on a deep 60-bar dip confirmed by an uptick.
+    if (closes.length <= LOOKBACK + 1) return [];
     const prev = closes[closes.length - 2];
     if (close <= prev) return [];
-    for (const t of TRIGGERS) {
-      if (closes.length <= t.lookback) continue;
-      const ago = closes[closes.length - 1 - t.lookback];
-      if (bpsChange(close, ago) <= -t.dipBps && state.cash > 0n) {
-        active = t;
-        return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
-      }
+    const ago = closes[closes.length - 1 - LOOKBACK];
+    if (bpsChange(close, ago) <= -DIP_BPS && state.cash > 0n) {
+      return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
     return [];
   },
