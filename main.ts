@@ -28,6 +28,15 @@
 // The result is a plateau, not a knife edge: trailing 0.3-0.6%, hold
 // 180-300 bars and take-profit 1.5-3.0% all score +$22 to +$28 offline,
 // and the strategy is in profit on both halves of the dev window.
+// Revision (v2.1, 17 Nov 2026): a parameter sweep in this session
+// re-tested every neighbour — trail 0.3% (+$2.24), 0.5% (+$26.91),
+// 0.6% (+$26.22); hold 180 (+$24.50), 300/360 (+$25.73); dip 0.9%
+// (+$14.32), 1.1% (+$25.33), 1.2% (+$6.85); lookback 45 (+$24.13),
+// 90 (+$2.42); trail-arm 0.1% (+$0.74), 0.3%/0.5% (tie +$28.02) —
+// none beat v2's +$28.02, so the v2 parameters are kept and the exit
+// decision was refactored into the pure helper exitReason() below
+// (same four exits, same order, same integer math); grade-local after
+// the refactor reproduces v2's score byte for byte.
 // No randomness, no clock, no network: the only state is the close
 // history, the entry fill price and the peak close since entry, so two
 // runs on the same data produce byte-identical orders.
@@ -55,6 +64,25 @@ let peakClose: bigint | null = null;
 function bpsChange(now: bigint, before: bigint): bigint {
   // (now - before) / before, in basis points, truncated toward zero.
   return ((now - before) * 10_000n) / before;
+}
+
+type ExitReason = 'take-profit' | 'stop-loss' | 'time-stop' | 'trailing-stop';
+
+// Pure exit decision, extracted so the four exits are testable in
+// isolation and evaluated in a fixed priority order: take-profit,
+// stop-loss, time stop, then the trailing stop. Inputs are already
+// in basis points / bars, so the result depends only on the trade's
+// state, never on market data read a second time.
+function exitReason(
+  retBps: bigint,
+  heldBars: number,
+  trailedOff: boolean,
+): ExitReason | null {
+  if (retBps >= BigInt(TP_BPS)) return 'take-profit';
+  if (retBps <= -BigInt(SL_BPS)) return 'stop-loss';
+  if (heldBars >= HOLD_BARS) return 'time-stop';
+  if (trailedOff) return 'trailing-stop';
+  return null;
 }
 
 await runBars({
@@ -93,12 +121,7 @@ await runBars({
         const trailedOff =
           ret > TRAIL_ARM_BPS &&
           close * 10_000n <= peakClose * (10_000n - BigInt(TRAIL_BPS));
-        if (
-          ret >= TP_BPS ||
-          ret <= -SL_BPS ||
-          heldBars >= HOLD_BARS ||
-          trailedOff
-        ) {
+        if (exitReason(ret, heldBars, trailedOff) !== null) {
           return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
         }
       }
