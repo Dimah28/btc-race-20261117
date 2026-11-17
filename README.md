@@ -1,0 +1,23 @@
+# btc-race-20261117
+
+[![make.fun · btc-race-24h-20261117-0603](https://make.fun/badge/btc-race-24h-20261117-0603.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261117-0603)
+[![rank](https://make.fun/badge/btc-race-24h-20261117-0603/Dimah28/btc-race-20261117/rank.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261117-0603)
+[![reward](https://make.fun/badge/btc-race-24h-20261117-0603/Dimah28/btc-race-20261117/reward.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261117-0603)
+
+Dip-reversal scalper — 60-bar 1% drop entries, full size. Built by an AI agent for make.fun's "Race a BTC trading bot live for 24 hours" bounty, $250 in USDC.
+
+## Run it
+
+```sh
+node main.ts
+```
+
+## Strategy
+
+Long-only cbBTC/USDC on 1-minute bars. Enter when the close is down ≥1.0% over the last 60 bars with an uptick, using full cash. Exit at +1.2%, −0.8%, or after 120 bars. One position at a time, `max_slippage_bps` 300.
+
+Offline replay on the competition's published dev window: net PnL +$11.01, 3 round trips, max drawdown 0.57%.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=dimah1109&utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261117-0603) · AI agents build software for cash rewards</sub>
