@@ -12,8 +12,11 @@
 //
 //   Entry: close down >= 1.0% over the last 60 bars AND an uptick
 //          (close above the previous bar's close), full cash, one position.
+//          A second, slower trigger covers deep two-hour grinds: down
+//          >= 1.5% over 120 bars with an uptick.
 //   Exit:  +1.2% from the fill price, or -0.8%, or 120 bars held, whichever
-//          comes first; sells the whole position.
+//          comes first (+1.5% / -1.0% / 180 bars for the slow trigger);
+//          sells the whole position.
 //   max_slippage_bps 300 on every order.
 //
 // Offline replay of the same rules on the dev window (same fill model:
@@ -30,16 +33,23 @@ import type { BarsState, Batch } from './vendor/makefun-bars.ts';
 const SYMBOL = 'CBBTC';
 
 // Strategy parameters (basis points unless noted).
-const LOOKBACK_BARS = 60; // dip measured over this many bars
-const DIP_BPS = 100; // entry: close down at least 1.0% over LOOKBACK_BARS
-const TAKE_PROFIT_BPS = 120; // exit: +1.2% from the fill price
-const STOP_LOSS_BPS = 80; // exit: -0.8% from the fill price
-const MAX_HOLD_BARS = 120; // exit: 120 bars after the fill, at the latest
+//
+// Two entry triggers, both dip-reversals confirmed by an uptick, full cash,
+// one position at a time. Trigger A is the workhorse, tuned on the dev
+// window; trigger B never fired there (no 120-bar drop of 1.5% while flat),
+// so adding it leaves the dev result unchanged, but it covers a case A
+// misses on the unseen race day: a slow two-hour grind down with no single
+// hour down 1%. Its exits are wider to match its slower scale.
+const TRIGGERS = [
+  { lookback: 60, dipBps: 100, tpBps: 120, slBps: 80, holdBars: 120 }, // A
+  { lookback: 120, dipBps: 150, tpBps: 150, slBps: 100, holdBars: 180 }, // B
+];
 const MAX_SLIPPAGE_BPS = 300;
 
 const closes: bigint[] = [];
 let entryPrice: bigint | null = null;
 let entrySeq = -1;
+let active: (typeof TRIGGERS)[number] | null = null;
 
 function bpsChange(now: bigint, before: bigint): bigint {
   // (now - before) / before, in basis points, truncated toward zero.
@@ -58,6 +68,7 @@ await runBars({
         } else {
           entryPrice = null;
           entrySeq = -1;
+          active = null;
         }
       }
     }
@@ -72,24 +83,31 @@ await runBars({
     const qty = held === undefined ? 0n : held.qty;
 
     if (qty > 0n) {
-      // Holding: take profit, stop loss, or time stop.
-      if (entryPrice !== null) {
+      // Holding: take profit, stop loss, or time stop, per the trigger
+      // that opened the position.
+      if (entryPrice !== null && active !== null) {
         const ret = bpsChange(close, entryPrice);
         const heldBars = batch.seq - entrySeq;
-        if (ret >= TAKE_PROFIT_BPS || ret <= -STOP_LOSS_BPS || heldBars >= MAX_HOLD_BARS) {
+        if (ret >= active.tpBps || ret <= -active.slBps || heldBars >= active.holdBars) {
           return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
         }
       }
       return [];
     }
 
-    // Flat: enter only on a deep 60-bar dip confirmed by an uptick.
-    if (closes.length <= LOOKBACK_BARS) return [];
-    const ago = closes[closes.length - 1 - LOOKBACK_BARS];
+    // Flat: enter on the first trigger whose dip + uptick both hold.
+    // A is tried first: when both fire on the same bar, the faster, tighter
+    // trigger owns the trade.
+    if (closes.length <= 1) return [];
     const prev = closes[closes.length - 2];
-    const drop = bpsChange(close, ago);
-    if (drop <= -DIP_BPS && close > prev && state.cash > 0n) {
-      return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    if (close <= prev) return [];
+    for (const t of TRIGGERS) {
+      if (closes.length <= t.lookback) continue;
+      const ago = closes[closes.length - 1 - t.lookback];
+      if (bpsChange(close, ago) <= -t.dipBps && state.cash > 0n) {
+        active = t;
+        return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      }
     }
     return [];
   },
